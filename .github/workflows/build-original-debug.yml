@@ -1,0 +1,189 @@
+# Emplacement dans le fork : .github/workflows/build-original-debug.yml
+#
+# But : compiler le LeviLaunchroid ORIGINAL (aucune modification) en APK debug.
+# Base : le fichier .github/workflows/android.yml de LiteLDev/LeviLaunchroid,
+# tel qu'il apparait dans le run #825 (commit fe4a9ee, 23 octobre 2026).
+# Ce workflow n'a PAS ete execute par son auteur.
+#
+# Ecarts volontaires par rapport a l'original :
+#  - declenchement manuel uniquement (workflow_dispatch) ;
+#  - runner epingle sur ubuntu-24.04 (l'original utilise ubuntu-latest, qui migre vers Ubuntu 26) ;
+#  - pas de secrets : placeholder Firebase (comme l'original) et cle CurseForge vide ;
+#  - le build passe par un controle de compilation (comme l'original sans secret),
+#    puis par assembleDebug, pour isoler la cause en cas d'echec ;
+#  - le script validate_release_content.py est informatif (non bloquant).
+
+name: Build original LeviLaunchroid (debug)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: "recursive"
+
+      - name: Verifier les sous-modules natifs
+        shell: bash
+        run: |
+          # Chemins lus dans .gitmodules de LeviLaunchroid
+          status=0
+          for d in app/src/main/cpp/preloader app/src/main/cpp/libHttpClient; do
+            if [ -z "$(ls -A "$d" 2>/dev/null)" ]; then
+              echo "::error title=Sous-module manquant::Le dossier $d est vide ou absent. Le depot a probablement ete copie ou importe sans ses sous-modules (voir .gitmodules)."
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: Validate release content (informatif)
+        continue-on-error: true
+        run: python3 scripts/validate_release_content.py
+
+      - name: Prepare google-services.json (placeholder CI comme l'original)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app
+          cat > app/google-services.json <<'JSON'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "ci-placeholder",
+              "storage_bucket": "ci-placeholder.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+                  "android_client_info": {
+                    "package_name": "org.levimc.launcher"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  {
+                    "current_key": "AIzaSyCIOnlyPlaceholderKey"
+                  }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": []
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          JSON
+          python3 -m json.tool app/google-services.json > /dev/null
+          echo "Placeholder Firebase ecrit dans app/google-services.json"
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Accept Licenses
+        shell: bash
+        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
+      - name: Install Build Tools 35.0.0
+        run: sdkmanager "build-tools;35.0.0"
+
+      - name: Setup Xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: "2.9.9"
+          actions-cache-folder: ".xmake-cache"
+          actions-cache-key: "ubuntulinux-ci"
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28c
+          link-to-sdk: true
+
+      - name: Afficher les versions exigees par le depot
+        shell: bash
+        run: |
+          # Etape de decouverte : affiche les lignes utiles des fichiers de configuration.
+          # Les fichiers absents sont ignores.
+          {
+            echo "## Versions lues dans le depot"
+            for f in gradle/wrapper/gradle-wrapper.properties gradle/libs.versions.toml app/build.gradle app/build.gradle.kts; do
+              if [ -f "$f" ]; then
+                echo "### $f"
+                echo '```'
+                grep -nE "distributionUrl|agp|kotlin|compileSdk|targetSdk|minSdk|ndkVersion|cmake|applicationId|namespace|abiFilters|google|firebase|crashlytics|JavaVersion|jvmTarget" "$f" || true
+                echo '```'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          java -version
+          echo "ANDROID_HOME=${ANDROID_HOME}"
+          ls "${ANDROID_HOME}/ndk" 2>/dev/null || true
+          xmake --version || true
+          cmake --version || true
+
+      - name: Grant Execute Permission to gradlew
+        run: chmod +x ./gradlew
+
+      - name: Inject API Keys (cle CurseForge vide)
+        run: echo "curseforge.api_key=" >> local.properties
+
+      - name: Controle de compilation (comme l'original sans secret)
+        run: ./gradlew :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Collecter et nommer l'APK
+        shell: bash
+        run: |
+          apk="$(find app/build/outputs/apk/debug -name '*.apk' | head -n 1)"
+          if [ -z "$apk" ]; then
+            echo "::error title=Aucun APK::assembleDebug a fini sans APK dans app/build/outputs/apk/debug."
+            exit 1
+          fi
+          mkdir -p dist
+          out="dist/LeviLaunchroid-original-debug-${GITHUB_SHA::7}.apk"
+          cp "$apk" "$out"
+          sha256sum "$out" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: LeviLauncher-original-debug-apk
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Aide au diagnostic (en cas d'echec)
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "## Echec : pistes a verifier"
+            echo "1. Si l'echec est dans Controle de compilation : probleme de code, de JDK, de SDK ou de NDK."
+            echo "2. Si l'echec est dans Build Debug APK : probleme de build natif (xmake, NDK r28c, CMake) ou de Firebase avec le placeholder."
+            echo "3. Sous-modules : app/src/main/cpp/preloader et app/src/main/cpp/libHttpClient doivent etre remplis."
+            echo "4. Fichier .github/workflows/actions.lock : son role n'a pas pu etre lu. Signalez toute erreur qui parle de lock ou d'epinglage."
+            echo "5. Collez-moi les 40 dernieres lignes de l'etape en echec, et le resume Versions lues dans le depot."
+          } >> "$GITHUB_STEP_SUMMARY"
